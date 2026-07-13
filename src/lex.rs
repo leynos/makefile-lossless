@@ -194,7 +194,7 @@ impl<'a> Lexer<'a> {
                             Some((SyntaxKind::QUOTE, c.to_string()))
                         }
                     }
-                    ':' | '=' | '?' | '+' => {
+                    ':' | '=' | '?' | '+' | '!' => {
                         let text = self.input.next().unwrap().to_string()
                             + self
                                 .read_while(|c| c == ':' || c == '=' || c == '?')
@@ -388,6 +388,26 @@ rule: prerequisite
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
                 (OPERATOR, "?="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "value"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_shell_assignment() {
+        assert_eq!(
+            lex("VARIABLE != printf value\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "VARIABLE"),
+                (WHITESPACE, " "),
+                (OPERATOR, "!="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "printf"),
                 (WHITESPACE, " "),
                 (IDENTIFIER, "value"),
                 (NEWLINE, "\n"),

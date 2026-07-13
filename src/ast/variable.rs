@@ -386,6 +386,16 @@ mod tests {
     }
 
     #[test]
+    fn test_assignment_operator_shell() {
+        let makefile: Makefile = "KERNEL != uname -r\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("KERNEL".to_string()));
+        assert_eq!(var.assignment_operator(), Some("!=".to_string()));
+        assert_eq!(var.raw_value(), Some("uname -r".to_string()));
+        assert_eq!(makefile.code(), "KERNEL != uname -r\n");
+    }
+
+    #[test]
     fn test_assignment_operator_export() {
         let makefile: Makefile = "export VAR := value\n".parse().unwrap();
         let var = makefile.variable_definitions().next().unwrap();
