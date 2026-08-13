@@ -736,6 +736,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Handle `override` and `export` prefixes (in either order). Both
             // are independent modifiers on a variable assignment.
             self.skip_ws();
+            let mut has_export_prefix = false;
             for _ in 0..2 {
                 if self.current() == Some(IDENTIFIER)
                     && matches!(
@@ -743,6 +744,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         "export" | "override"
                     )
                 {
+                    has_export_prefix |= self.tokens.last().unwrap().1.as_str() == "export";
                     self.bump();
                     self.skip_ws();
                 } else {
@@ -813,10 +815,41 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => {
                     // EOF after export VARNAME is fine
                 }
+                // `export A B C` exports several already-assigned variables.
+                // Only an `export` line may name a list: `override FOO BAR`
+                // has no such meaning in GNU Make and stays an error.
+                Some(IDENTIFIER) if has_export_prefix => self.parse_directive_name_list(),
                 _ => self.error("expected assignment operator".to_string()),
             }
 
             self.builder.finish_node();
+        }
+
+        /// Consume the remaining names of an `export` directive.
+        ///
+        /// The keyword and the first name are already consumed. Every further
+        /// name is kept as a token of the same VARIABLE node so that consumers
+        /// can recover the complete list, while `VariableDefinition::name()`
+        /// keeps reporting the first name and stays backwards compatible.
+        fn parse_directive_name_list(&mut self) {
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.current() {
+                    Some(IDENTIFIER) | Some(WHITESPACE) => self.bump(),
+                    Some(COMMENT) => self.bump(),
+                    Some(NEWLINE) => {
+                        self.bump();
+                        break;
+                    }
+                    None => break,
+                    _ => {
+                        self.error("expected variable name".to_string());
+                        break;
+                    }
+                }
+            }
         }
 
         fn parse_variable_reference(&mut self) {
@@ -3049,6 +3082,116 @@ rule: dependency
         let variable = variables.pop().unwrap();
         assert_eq!(variable.name(), Some("VARIABLE".to_string()));
         assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_export_name_list() {
+        const EXPORT: &str = r#"export FOO BAR BAZ
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..19
+  VARIABLE@0..19
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+    WHITESPACE@14..15 " "
+    IDENTIFIER@15..18 "BAZ"
+    NEWLINE@18..19 "\n"
+"#
+        );
+
+        let root = parsed.root();
+
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        // `name()` keeps reporting the first name, so existing consumers are
+        // unaffected by the additional names now retained in the node.
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), None);
+        assert!(variable.is_export());
+    }
+
+    #[test]
+    fn test_parse_override_export_name_list() {
+        const EXPORT: &str = r#"override export FOO BAR
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+
+        let root = parsed.root();
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert!(variable.is_export());
+        assert!(variable.is_override());
+    }
+
+    #[test]
+    fn test_parse_export_name_list_at_eof() {
+        const EXPORT: &str = "export FOO BAR";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_export_name_list_with_comment() {
+        const EXPORT: &str = r#"export FOO BAR # exported for the build
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_name_list_without_directive_still_errors() {
+        // Only a directive line may name several variables. Without a leading
+        // keyword the line is not treated as an assignment at all — it is a
+        // rule missing its colon — so accepting name lists after `export` must
+        // not make `FOO BAR` parse cleanly.
+        const INVALID: &str = r#"FOO BAR
+"#;
+        let parsed = parse(INVALID, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected ':'".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_assignment_name_list_without_directive_still_errors() {
+        // The same holds inside `parse_assignment` itself: a line that reaches
+        // it without a directive keyword and then names a second identifier is
+        // still a malformed assignment. `FOO := 1` gives the parser a reason to
+        // treat the line as an assignment; the trailing `BAR` after the value
+        // is separate from the directive-list case.
+        const INVALID: &str = r#"override FOO BAR
+"#;
+        let parsed = parse(INVALID, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
     }
 
     #[test]
