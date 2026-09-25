@@ -3482,6 +3482,39 @@ endef
     }
 
     #[test]
+    fn test_keyword_in_a_name_list_is_a_name() {
+        // A directive keyword later on the line is one of the names, so it
+        // must not set the flag of the directive it spells: GNU Make 4.4.1
+        // unexports a variable called `export` on the first line and exports
+        // one called `override` on the second.
+        for (text, (is_export, is_unexport, is_override)) in [
+            ("unexport FOO export\n", (false, true, false)),
+            ("export FOO override\n", (true, false, false)),
+            ("unexport export FOO = 3\n", (true, true, false)),
+            // The parser takes at most two prefixes, so a third keyword is
+            // the name.
+            ("export export override\n", (true, false, false)),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(
+                (
+                    variable.is_export(),
+                    variable.is_unexport(),
+                    variable.is_override()
+                ),
+                (is_export, is_unexport, is_override),
+                "input {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_name_less_unexport() {
         // A bare `unexport` is valid GNU Make, but it names no variable. The
         // node reports the directive and no name, so a consumer can tell it

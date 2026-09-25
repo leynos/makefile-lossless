@@ -60,6 +60,26 @@ impl VariableDefinition {
         identifiers.len() == 1 && self.assignment_operator().is_some()
     }
 
+    /// The directive keywords leading the definition, in source order.
+    ///
+    /// These are the tokens the parser consumed as prefixes: at most two of
+    /// `export` and `override`, or `unexport` in the first position. A
+    /// keyword later on the line is a name, as in `unexport FOO export`, and
+    /// so is a keyword that is the only identifier of an assignment.
+    /// `unexport` is accepted in either position here because only the first
+    /// prefix is ever read for it, by `is_unexport`.
+    fn directive_prefixes(&self) -> Vec<String> {
+        let identifiers = self.identifiers();
+        if self.assigns_a_keyword_named_variable(&identifiers) {
+            return Vec::new();
+        }
+        identifiers
+            .into_iter()
+            .take(2)
+            .take_while(|text| matches!(text.as_str(), "export" | "override" | "unexport"))
+            .collect()
+    }
+
     /// Returns true if this assignment is a `define` ... `endef` block.
     pub fn is_define(&self) -> bool {
         self.syntax().children_with_tokens().any(|it| {
@@ -70,12 +90,13 @@ impl VariableDefinition {
 
     /// Check if this variable definition is exported
     ///
-    /// `export = 1` assigns a variable called `export` and exports nothing.
+    /// Only a leading `export` keyword counts: `export = 1` assigns a
+    /// variable called `export`, and `unexport FOO export` unexports a
+    /// variable called `export`.
     pub fn is_export(&self) -> bool {
-        self.syntax()
-            .children_with_tokens()
-            .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
-            && !self.assigns_a_keyword_named_variable(&self.identifiers())
+        self.directive_prefixes()
+            .iter()
+            .any(|prefix| prefix == "export")
     }
 
     /// Check if this variable definition is an `unexport` directive
@@ -96,15 +117,16 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("FOO".to_string()));
     /// ```
     pub fn is_unexport(&self) -> bool {
-        let identifiers = self.identifiers();
-        identifiers.first().is_some_and(|first| first == "unexport")
-            && !self.assigns_a_keyword_named_variable(&identifiers)
+        self.directive_prefixes()
+            .first()
+            .is_some_and(|prefix| prefix == "unexport")
     }
 
     /// Check if this variable definition uses the `override` directive
     ///
     /// `override FOO = bar` makes the assignment take precedence over any
-    /// value passed on the make command line.
+    /// value passed on the make command line. Only a leading `override`
+    /// keyword counts: in `export FOO override`, `override` is a name.
     ///
     /// # Example
     /// ```
@@ -115,10 +137,9 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("CC".to_string()));
     /// ```
     pub fn is_override(&self) -> bool {
-        self.syntax().children_with_tokens().any(|it| {
-            it.as_token()
-                .is_some_and(|token| token.text() == "override")
-        })
+        self.directive_prefixes()
+            .iter()
+            .any(|prefix| prefix == "override")
     }
 
     /// Get the assignment operator/flavor used in this variable definition
