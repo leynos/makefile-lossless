@@ -22,20 +22,22 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 
 impl VariableDefinition {
     /// Get the name of the variable definition
+    ///
+    /// Leading directive keywords are skipped, unless a keyword is the only
+    /// identifier: `unexport = 1` assigns a variable named `unexport`.
     pub fn name(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            it.as_token().and_then(|it| {
-                if it.kind() == IDENTIFIER
-                    && it.text() != "export"
-                    && it.text() != "override"
-                    && it.text() != "define"
-                {
-                    Some(it.text().to_string())
-                } else {
-                    None
-                }
-            })
-        })
+        const KEYWORDS: [&str; 4] = ["export", "unexport", "override", "define"];
+        let mut identifiers = self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|token| token.kind() == IDENTIFIER)
+            .map(|token| token.text().to_string())
+            .peekable();
+        let first = identifiers.peek().cloned();
+        identifiers
+            .find(|text| !KEYWORDS.contains(&text.as_str()))
+            .or_else(|| first.filter(|_| self.assignment_operator().is_some()))
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -51,6 +53,27 @@ impl VariableDefinition {
         self.syntax()
             .children_with_tokens()
             .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+    }
+
+    /// Check if this variable definition is an `unexport` directive
+    ///
+    /// `unexport FOO` keeps a previously exported variable out of the
+    /// environment of recipe commands.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "FOO = 1\nunexport FOO\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().nth(1).unwrap();
+    /// assert!(var.is_unexport());
+    /// assert!(!var.is_export());
+    /// assert_eq!(var.name(), Some("FOO".to_string()));
+    /// ```
+    pub fn is_unexport(&self) -> bool {
+        self.syntax().children_with_tokens().any(|it| {
+            it.as_token()
+                .is_some_and(|token| token.text() == "unexport")
+        })
     }
 
     /// Check if this variable definition uses the `override` directive
