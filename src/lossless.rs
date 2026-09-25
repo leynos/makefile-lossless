@@ -838,8 +838,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => {
                     // EOF after export VARNAME is fine
                 }
-                // `export A B C` exports several already-assigned variables.
-                Some(IDENTIFIER) if allows_name_list => self.parse_export_name_list(),
+                // `export A B C` exports several already-assigned variables,
+                // and `export A # why` may end in a comment after one name.
+                Some(IDENTIFIER | COMMENT) if allows_name_list => self.parse_export_name_list(),
                 // The list may equally begin on a continued line.
                 _ if allows_name_list && self.is_line_continuation() => {
                     self.parse_export_name_list()
@@ -3554,6 +3555,28 @@ endef
                 "input {text:?}"
             );
             assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_single_name_directive_with_a_trailing_comment() {
+        // GNU Make 4.4.1 accepts a comment after one exported or unexported
+        // name. The parser used to report a missing assignment operator here,
+        // after `export` as well as after `unexport`.
+        for (text, is_unexport) in [
+            ("FOO = 1\nexport FOO # why\n", false),
+            ("FOO = 1\nunexport FOO # why\n", true),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().nth(1).unwrap();
+            assert_eq!(variable.name(), Some("FOO".to_string()), "input {text:?}");
+            assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
         }
     }
 
