@@ -3487,13 +3487,15 @@ endef
         // must not set the flag of the directive it spells: GNU Make 4.4.1
         // unexports a variable called `export` on the first line and exports
         // one called `override` on the second.
-        for (text, (is_export, is_unexport, is_override)) in [
-            ("unexport FOO export\n", (false, true, false)),
-            ("export FOO override\n", (true, false, false)),
-            ("unexport export FOO = 3\n", (true, true, false)),
+        for (text, name, (is_export, is_unexport, is_override)) in [
+            ("unexport FOO export\n", "FOO", (false, true, false)),
+            ("export FOO override\n", "FOO", (true, false, false)),
+            ("unexport export FOO = 3\n", "FOO", (true, true, false)),
             // The parser takes at most two prefixes, so a third keyword is
             // the name.
-            ("export export override\n", (true, false, false)),
+            ("export export override\n", "override", (true, false, false)),
+            // A keyword directly before the operator is the name too.
+            ("export override = 1\n", "override", (true, false, false)),
         ] {
             let parsed = parse(text, None);
             assert!(
@@ -3511,6 +3513,7 @@ endef
                 (is_export, is_unexport, is_override),
                 "input {text:?}"
             );
+            assert_eq!(variable.name(), Some(name.to_string()), "input {text:?}");
         }
     }
 
