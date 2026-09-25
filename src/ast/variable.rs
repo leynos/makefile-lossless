@@ -28,28 +28,36 @@ impl VariableDefinition {
     /// `unexport` is a keyword only when it leads the line, so
     /// `export unexport` names a variable called `unexport`.
     pub fn name(&self) -> Option<String> {
-        let identifiers: Vec<String> = self
-            .syntax()
+        let identifiers = self.identifiers();
+        if self.assigns_a_keyword_named_variable(&identifiers) {
+            return identifiers.into_iter().next();
+        }
+        let is_keyword = |index: usize, text: &str| match text {
+            "export" | "override" | "define" => true,
+            "unexport" => index == 0,
+            _ => false,
+        };
+        identifiers
+            .into_iter()
+            .enumerate()
+            .find(|(index, text)| !is_keyword(*index, text))
+            .map(|(_, text)| text)
+    }
+
+    /// The definition's direct identifier tokens, keywords included.
+    fn identifiers(&self) -> Vec<String> {
+        self.syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
             .filter(|token| token.kind() == IDENTIFIER)
             .map(|token| token.text().to_string())
-            .collect();
-        let is_keyword = |index: usize, text: &str| match text {
-            "export" | "override" | "define" => true,
-            "unexport" => index == 0 && identifiers.len() > 1,
-            _ => false,
-        };
-        let keyword_as_name = || match identifiers.as_slice() {
-            [only] if self.assignment_operator().is_some() => Some(only.clone()),
-            _ => None,
-        };
-        identifiers
-            .iter()
-            .enumerate()
-            .find(|(index, text)| !is_keyword(*index, text))
-            .map(|(_, text)| text.clone())
-            .or_else(keyword_as_name)
+            .collect()
+    }
+
+    /// Whether the definition assigns a variable whose name is a keyword, as
+    /// in `unexport = 1`: the keyword is then its only identifier.
+    fn assigns_a_keyword_named_variable(&self, identifiers: &[String]) -> bool {
+        identifiers.len() == 1 && self.assignment_operator().is_some()
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -61,18 +69,22 @@ impl VariableDefinition {
     }
 
     /// Check if this variable definition is exported
+    ///
+    /// `export = 1` assigns a variable called `export` and exports nothing.
     pub fn is_export(&self) -> bool {
         self.syntax()
             .children_with_tokens()
             .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+            && !self.assigns_a_keyword_named_variable(&self.identifiers())
     }
 
     /// Check if this variable definition is an `unexport` directive
     ///
     /// `unexport FOO` keeps a previously exported variable out of the
-    /// environment of recipe commands. Only a leading `unexport` followed by
-    /// a name is the directive: `export unexport` exports a variable called
-    /// `unexport`, and `unexport = 1` assigns one.
+    /// environment of recipe commands. Only a leading `unexport` is the
+    /// directive: `export unexport` exports a variable called `unexport`, and
+    /// `unexport = 1` assigns one. A bare `unexport` with no names is the
+    /// directive too.
     ///
     /// # Example
     /// ```
@@ -84,15 +96,9 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("FOO".to_string()));
     /// ```
     pub fn is_unexport(&self) -> bool {
-        let mut identifiers = self
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|token| token.kind() == IDENTIFIER);
-        identifiers
-            .next()
-            .is_some_and(|token| token.text() == "unexport")
-            && identifiers.next().is_some()
+        let identifiers = self.identifiers();
+        identifiers.first().is_some_and(|first| first == "unexport")
+            && !self.assigns_a_keyword_named_variable(&identifiers)
     }
 
     /// Check if this variable definition uses the `override` directive

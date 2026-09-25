@@ -3477,7 +3477,27 @@ endef
                 "input {text:?}"
             );
             assert!(!variable.is_unexport(), "input {text:?}");
+            assert!(!variable.is_export(), "input {text:?}");
         }
+    }
+
+    #[test]
+    fn test_parse_name_less_unexport() {
+        // A bare `unexport` is valid GNU Make, but it names no variable. The
+        // node reports the directive and no name, so a consumer can tell it
+        // from `unexport = 1`.
+        let parsed = parse("unexport\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected variable name".to_string()]
+        );
+        let variable = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(variable.name(), None);
+        assert!(variable.is_unexport());
     }
 
     #[test]
