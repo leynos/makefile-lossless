@@ -736,23 +736,47 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Handle `override` and `export` prefixes (in either order). Both
             // are independent modifiers on a variable assignment.
             self.skip_ws();
-            for _ in 0..2 {
-                if self.current() == Some(IDENTIFIER)
-                    && matches!(
-                        self.tokens.last().unwrap().1.as_str(),
-                        "export" | "override"
-                    )
-                {
-                    self.bump();
-                    self.skip_ws();
-                } else {
+            // Only a line *leading* with `export` or `unexport` may name a list
+            // of already assigned variables. GNU Make rejects `override export
+            // FOO BAR` with "missing separator", so the first keyword decides,
+            // not the mere presence of `export` among the prefixes.
+            //
+            // `unexport` takes the same shapes as `export` in GNU Make 4.4.1,
+            // including an assignment, but only in the leading position:
+            // `override unexport FOO` is a "missing separator" there too.
+            let mut leads_with_export = false;
+            for index in 0..2 {
+                let Some((IDENTIFIER, keyword)) = self.tokens.last() else {
+                    break;
+                };
+                let is_prefix = match keyword.as_str() {
+                    "export" | "override" => true,
+                    "unexport" => index == 0,
+                    _ => false,
+                };
+                // `unexport = 1` assigns a variable named `unexport`.
+                if !is_prefix || self.assignment_operator_follows() {
                     break;
                 }
+                if index == 0 {
+                    leads_with_export = matches!(keyword.as_str(), "export" | "unexport");
+                }
+                self.bump();
+                self.skip_ws();
             }
 
             // Parse variable name
+            let mut names_a_define = false;
             match self.current() {
-                Some(IDENTIFIER) => self.bump(),
+                Some(IDENTIFIER) => {
+                    // `export define FOO ... endef` is valid GNU Make, but the
+                    // name slot swallows the `define` keyword here, so what
+                    // follows is the block's name rather than a further export
+                    // name. Treating it as a name list would erase the only
+                    // signal that this line was not understood.
+                    names_a_define = self.tokens.last().is_some_and(|(_, text)| text == "define");
+                    self.bump();
+                }
                 Some(DOLLAR) => self.parse_variable_reference(),
                 _ => {
                     self.error("expected variable name".to_string());
@@ -760,6 +784,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     return;
                 }
             }
+            let allows_name_list = leads_with_export && !names_a_define;
 
             // Skip whitespace and parse operator
             self.skip_ws();
@@ -813,10 +838,63 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => {
                     // EOF after export VARNAME is fine
                 }
+                // `export A B C` exports several already-assigned variables,
+                // and `export A # why` may end in a comment after one name.
+                Some(IDENTIFIER | COMMENT) if allows_name_list => self.parse_export_name_list(),
+                // The list may equally begin on a continued line.
+                _ if allows_name_list && self.is_line_continuation() => {
+                    self.parse_export_name_list()
+                }
                 _ => self.error("expected assignment operator".to_string()),
             }
 
             self.builder.finish_node();
+        }
+
+        /// Report whether the first token after the current one, ignoring
+        /// whitespace, is an assignment operator.
+        fn assignment_operator_follows(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .skip(1)
+                .find(|(kind, _)| *kind != WHITESPACE)
+                .is_some_and(|(kind, text)| {
+                    *kind == OPERATOR
+                        && ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&text.as_str())
+                })
+        }
+
+        /// Consume the remaining names of an `export` directive.
+        ///
+        /// The keyword and the first name are already consumed. Every further
+        /// name is kept as a token of the same VARIABLE node so that consumers
+        /// can recover the complete list, while `VariableDefinition::name()`
+        /// keeps reporting the first name and stays backwards compatible.
+        ///
+        /// The names are therefore the node's direct IDENTIFIER tokens with
+        /// the leading `export` and `override` keywords skipped, exactly as
+        /// `VariableDefinition::name()` skips them to find the first.
+        fn parse_export_name_list(&mut self) {
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.current() {
+                    Some(IDENTIFIER | WHITESPACE | COMMENT) => self.bump(),
+                    Some(NEWLINE) => {
+                        self.bump();
+                        break;
+                    }
+                    None => break,
+                    _ => {
+                        // Distinct from the missing-first-name message so a
+                        // consumer can tell the two positions apart.
+                        self.error("expected variable name in export list".to_string());
+                        break;
+                    }
+                }
+            }
         }
 
         fn parse_variable_reference(&mut self) {
@@ -1596,7 +1674,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
+                    IDENTIFIER if matches!(text.as_str(), "export" | "unexport" | "override") => {
+                        seen_directive = true
+                    }
                     IDENTIFIER if !seen_identifier => seen_identifier = true,
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
                         return seen_identifier || seen_directive
@@ -3049,6 +3129,470 @@ rule: dependency
         let variable = variables.pop().unwrap();
         assert_eq!(variable.name(), Some("VARIABLE".to_string()));
         assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_export_name_list() {
+        const EXPORT: &str = r#"export FOO BAR BAZ
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..19
+  VARIABLE@0..19
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+    WHITESPACE@14..15 " "
+    IDENTIFIER@15..18 "BAZ"
+    NEWLINE@18..19 "\n"
+"#
+        );
+
+        let root = parsed.root();
+
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        // `name()` keeps reporting the first name, so existing consumers are
+        // unaffected by the additional names now retained in the node.
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), None);
+        assert!(variable.is_export());
+    }
+
+    /// The names a directive line carries, as a consumer recovers them: the
+    /// node's direct identifier tokens.
+    fn export_identifier_tokens(text: &str) -> Vec<String> {
+        let parsed = parse(text, None);
+        let root = parsed.root();
+        let variable = root.variable_definitions().next().unwrap();
+        variable
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == IDENTIFIER)
+            .map(|token| token.text().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_export_name_list_identifier_tokens() {
+        // The contract consumers rely on: every name is a direct identifier
+        // token of the node, behind the leading keywords.
+        assert_eq!(
+            export_identifier_tokens("export FOO BAR BAZ\n"),
+            vec!["export", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_parse_override_export_name_list_errors() {
+        // GNU Make rejects `override export FOO BAR` with "missing separator";
+        // only a line leading with `export` may name a list.
+        const EXPORT: &str = r#"override export FOO BAR
+"#;
+        let parsed = parse(EXPORT, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_export_override_name_list() {
+        // GNU Make accepts this, reading `override` as one of the exported
+        // names rather than as a modifier.
+        const EXPORT: &str = r#"export override FOO
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_exported_define_is_unchanged() {
+        // `export define FOO ... endef` is valid GNU Make, but the name slot
+        // swallows `define`, so `FOO` is the block's name and not a further
+        // export name. The directive-list path must not fire and erase the
+        // diagnostic that says so.
+        const EXPORT: &str = r#"export define FOO
+body
+endef
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.message == "expected assignment operator"),
+            "{:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_at_eof() {
+        const EXPORT: &str = "export FOO BAR";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..14
+  VARIABLE@0..14
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_with_comment() {
+        const EXPORT: &str = r#"export FOO BAR # why
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..21
+  VARIABLE@0..21
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+    WHITESPACE@14..15 " "
+    COMMENT@15..20 "# why"
+    NEWLINE@20..21 "\n"
+"##
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_continued_before_first_extra_name() {
+        // The continuation may come before any further name, which the first
+        // implementation rejected.
+        const EXPORT: &str = "export FOO \\\n\tBAR BAZ\n";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            export_identifier_tokens(EXPORT),
+            vec!["export", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_continued_after_first_extra_name() {
+        const EXPORT: &str = "export FOO BAR \\\n\tBAZ\n";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            export_identifier_tokens(EXPORT),
+            vec!["export", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_export_name_list_round_trips() {
+        // Losslessness is the crate's core promise, so every shape the new
+        // path can take must reproduce its input exactly.
+        for text in [
+            "export FOO BAR BAZ\n",
+            "export FOO BAR",
+            "export FOO BAR # why\n",
+            "export FOO \\\n\tBAR\n",
+            "export override FOO\n",
+            "override export FOO BAR\n",
+            "export FOO BAR := baz\n",
+            "export define FOO\nbody\nendef\n",
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_name_list_without_directive_still_errors() {
+        // Only a directive line may name several variables. Without a leading
+        // keyword the line is not treated as an assignment at all — it is a
+        // rule missing its colon — so accepting name lists after `export` must
+        // not make `FOO BAR` parse cleanly.
+        const INVALID: &str = r#"FOO BAR
+"#;
+        let parsed = parse(INVALID, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected ':'".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_override_without_export_still_errors() {
+        // This is the case that exercises the gate: `override` reaches
+        // `parse_assignment` as a directive prefix, but only `export` licenses
+        // a name list, and GNU Make rejects this line too.
+        const INVALID: &str = r#"override FOO BAR
+"#;
+        let parsed = parse(INVALID, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_bare_unexport() {
+        // `unexport NAME` is a directive like `export NAME`, not a rule
+        // missing its colon.
+        const UNEXPORT: &str = "FOO = 1\nunexport FOO\n";
+        let parsed = parse(UNEXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert!(parsed.positioned_errors.is_empty());
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..21
+  VARIABLE@0..8
+    IDENTIFIER@0..3 "FOO"
+    WHITESPACE@3..4 " "
+    OPERATOR@4..5 "="
+    WHITESPACE@5..6 " "
+    EXPR@6..7
+      IDENTIFIER@6..7 "1"
+    NEWLINE@7..8 "\n"
+  VARIABLE@8..21
+    IDENTIFIER@8..16 "unexport"
+    WHITESPACE@16..17 " "
+    IDENTIFIER@17..20 "FOO"
+    NEWLINE@20..21 "\n"
+"#
+        );
+
+        let root = parsed.root();
+        let variable = root.variable_definitions().nth(1).unwrap();
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), None);
+        assert!(variable.is_unexport());
+        assert!(!variable.is_export());
+        assert_eq!(root.rules().count(), 0);
+    }
+
+    #[test]
+    fn test_parse_unexport_name_list() {
+        const UNEXPORT: &str = "unexport FOO BAR BAZ\n";
+        let parsed = parse(UNEXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            export_identifier_tokens(UNEXPORT),
+            vec!["unexport", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_parse_unexport_assignment() {
+        // GNU Make 4.4.1 assigns and unexports here, exactly as `export`
+        // would assign and export.
+        const UNEXPORT: &str = "unexport FOO = 3\n";
+        let parsed = parse(UNEXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let variable = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), Some("3".to_string()));
+        assert!(variable.is_unexport());
+    }
+
+    #[test]
+    fn test_parse_override_unexport_errors() {
+        // GNU Make rejects `override unexport FOO` with "missing separator":
+        // `unexport` is a directive only in the leading position.
+        let parsed = parse("override unexport FOO\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unexport_after_assignments_parses_complete() {
+        // Before `unexport` was a directive, both files reported two
+        // `expected ':'` errors, neither on the `unexport` line: one on an
+        // earlier assignment and one a line past the end of the file.
+        for text in [
+            "A = 1\nB = 2\nC = 3\nunexport C\n",
+            "A = 1\nB = 2\nC = 3\nunexport C\n\nall:\n\techo done\n",
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            assert!(parsed.positioned_errors.is_empty(), "input {text:?}");
+            assert_eq!(parsed.root().variable_definitions().count(), 4);
+        }
+    }
+
+    #[test]
+    fn test_directive_keyword_as_variable_name() {
+        // GNU Make 4.4.1 reads a keyword directly followed by an assignment
+        // operator as the variable's name, not as a directive.
+        for (text, name, value) in [
+            ("unexport = 1\n", "unexport", "1"),
+            ("export = 2\n", "export", "2"),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(variable.name(), Some(name.to_string()), "input {text:?}");
+            assert_eq!(
+                variable.raw_value(),
+                Some(value.to_string()),
+                "input {text:?}"
+            );
+            assert!(!variable.is_unexport(), "input {text:?}");
+            assert!(!variable.is_export(), "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_keyword_in_a_name_list_is_a_name() {
+        // A directive keyword later on the line is one of the names, so it
+        // must not set the flag of the directive it spells: GNU Make 4.4.1
+        // unexports a variable called `export` on the first line and exports
+        // one called `override` on the second.
+        for (text, name, (is_export, is_unexport, is_override)) in [
+            ("unexport FOO export\n", "FOO", (false, true, false)),
+            ("export FOO override\n", "FOO", (true, false, false)),
+            ("unexport export FOO = 3\n", "FOO", (true, true, false)),
+            // The parser takes at most two prefixes, so a third keyword is
+            // the name.
+            ("export export override\n", "override", (true, false, false)),
+            // A keyword directly before the operator is the name too.
+            ("export override = 1\n", "override", (true, false, false)),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(
+                (
+                    variable.is_export(),
+                    variable.is_unexport(),
+                    variable.is_override()
+                ),
+                (is_export, is_unexport, is_override),
+                "input {text:?}"
+            );
+            assert_eq!(variable.name(), Some(name.to_string()), "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_name_less_unexport() {
+        // A bare `unexport` is valid GNU Make, but it names no variable. The
+        // node reports the directive and no name, so a consumer can tell it
+        // from `unexport = 1`.
+        let parsed = parse("unexport\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected variable name".to_string()]
+        );
+        let variable = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(variable.name(), None);
+        assert!(variable.is_unexport());
+    }
+
+    #[test]
+    fn test_unexport_as_a_directive_name() {
+        // `unexport` is a directive only when it leads the line. After another
+        // keyword, or after itself, it is the name of the variable concerned.
+        for (text, is_unexport) in [("export unexport\n", false), ("unexport unexport\n", true)] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(
+                variable.name(),
+                Some("unexport".to_string()),
+                "input {text:?}"
+            );
+            assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_single_name_directive_with_a_trailing_comment() {
+        // GNU Make 4.4.1 accepts a comment after one exported or unexported
+        // name. The parser used to report a missing assignment operator here,
+        // after `export` as well as after `unexport`.
+        for (text, is_unexport) in [
+            ("FOO = 1\nexport FOO # why\n", false),
+            ("FOO = 1\nunexport FOO # why\n", true),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().nth(1).unwrap();
+            assert_eq!(variable.name(), Some("FOO".to_string()), "input {text:?}");
+            assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_unexport_round_trips() {
+        for text in [
+            "unexport FOO\n",
+            "unexport FOO",
+            "unexport FOO BAR # why\n",
+            "unexport FOO \\\n\tBAR\n",
+            "unexport FOO = 3\n",
+            "override unexport FOO\n",
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
+        }
     }
 
     #[test]
