@@ -3476,6 +3476,28 @@ endef
                 Some(value.to_string()),
                 "input {text:?}"
             );
+            assert!(!variable.is_unexport(), "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_unexport_as_a_directive_name() {
+        // `unexport` is a directive only when it leads the line. After another
+        // keyword, or after itself, it is the name of the variable concerned.
+        for (text, is_unexport) in [("export unexport\n", false), ("unexport unexport\n", true)] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(
+                variable.name(),
+                Some("unexport".to_string()),
+                "input {text:?}"
+            );
+            assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
         }
     }
 

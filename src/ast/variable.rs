@@ -23,21 +23,33 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 impl VariableDefinition {
     /// Get the name of the variable definition
     ///
-    /// Leading directive keywords are skipped, unless a keyword is the only
-    /// identifier: `unexport = 1` assigns a variable named `unexport`.
+    /// Directive keywords are skipped, unless a keyword is the only identifier
+    /// of an assignment: `unexport = 1` assigns a variable named `unexport`.
+    /// `unexport` is a keyword only when it leads the line, so
+    /// `export unexport` names a variable called `unexport`.
     pub fn name(&self) -> Option<String> {
-        const KEYWORDS: [&str; 4] = ["export", "unexport", "override", "define"];
-        let mut identifiers = self
+        let identifiers: Vec<String> = self
             .syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
             .filter(|token| token.kind() == IDENTIFIER)
             .map(|token| token.text().to_string())
-            .peekable();
-        let first = identifiers.peek().cloned();
+            .collect();
+        let is_keyword = |index: usize, text: &str| match text {
+            "export" | "override" | "define" => true,
+            "unexport" => index == 0 && identifiers.len() > 1,
+            _ => false,
+        };
+        let keyword_as_name = || match identifiers.as_slice() {
+            [only] if self.assignment_operator().is_some() => Some(only.clone()),
+            _ => None,
+        };
         identifiers
-            .find(|text| !KEYWORDS.contains(&text.as_str()))
-            .or_else(|| first.filter(|_| self.assignment_operator().is_some()))
+            .iter()
+            .enumerate()
+            .find(|(index, text)| !is_keyword(*index, text))
+            .map(|(_, text)| text.clone())
+            .or_else(keyword_as_name)
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -58,7 +70,9 @@ impl VariableDefinition {
     /// Check if this variable definition is an `unexport` directive
     ///
     /// `unexport FOO` keeps a previously exported variable out of the
-    /// environment of recipe commands.
+    /// environment of recipe commands. Only a leading `unexport` followed by
+    /// a name is the directive: `export unexport` exports a variable called
+    /// `unexport`, and `unexport = 1` assigns one.
     ///
     /// # Example
     /// ```
@@ -70,10 +84,15 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("FOO".to_string()));
     /// ```
     pub fn is_unexport(&self) -> bool {
-        self.syntax().children_with_tokens().any(|it| {
-            it.as_token()
-                .is_some_and(|token| token.text() == "unexport")
-        })
+        let mut identifiers = self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|token| token.kind() == IDENTIFIER);
+        identifiers
+            .next()
+            .is_some_and(|token| token.text() == "unexport")
+            && identifiers.next().is_some()
     }
 
     /// Check if this variable definition uses the `override` directive
