@@ -33,8 +33,8 @@ pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
-    ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Identifier, Include, Lang,
-    Makefile, ParseError, PositionedParseError, Recipe, RecipeVariableReference, Rule,
+    ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Expansion, Identifier, Include,
+    Lang, Makefile, ParseError, PositionedParseError, Recipe, RecipeVariableReference, Rule,
     VariableDefinition, VariableReference, Vpath,
 };
 pub use parse::Parse;
@@ -101,6 +101,9 @@ pub enum SyntaxKind {
 
     // Blank lines
     BLANK_LINE, // A blank line between top-level items
+
+    // Kept last so the raw values of the kinds above do not change.
+    EXPANSION, // A bare `$(...)` line: a function call or variable expansion
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.
