@@ -133,8 +133,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         positioned_errors: Vec<PositionedParseError>,
         /// Token positions (start, end) in forward order, indexed by forward token index
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
-        /// current token index into token_positions (counting from the end since tokens are in reverse)
-        current_token_index: usize,
         /// The original text
         original_text: String,
         /// The makefile variant
@@ -170,7 +168,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     (tab_line, lines[tab_line - 1].to_string())
                 }
             } else {
-                let line = self.get_line_number_for_position(self.tokens.len());
+                let line = self.current_line_number();
                 (line, self.get_context_for_line(line))
             };
 
@@ -200,8 +198,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Add a positioned error at the current token position
         fn add_positioned_error(&mut self, message: String, code: Option<String>) {
-            let range = if self.current_token_index < self.token_positions.len() {
-                let (start, end) = self.token_positions[self.current_token_index];
+            let range = if let Some((start, end)) = self.current_token_position() {
                 rowan::TextRange::new(start, end)
             } else {
                 // Default to end of text if no current token
@@ -220,17 +217,24 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             });
         }
 
-        fn get_line_number_for_position(&self, position: usize) -> usize {
-            if position >= self.tokens.len() {
-                return self.original_text.matches('\n').count() + 1;
-            }
+        /// Returns the source range of the current token, or `None` at the
+        /// end of input.
+        ///
+        /// `tokens` is a stack holding the unconsumed tokens in reverse, and
+        /// `token_positions` lists every token in source order, so the
+        /// current token's source-order index is the number already consumed.
+        fn current_token_position(&self) -> Option<(rowan::TextSize, rowan::TextSize)> {
+            let index = self.token_positions.len().checked_sub(self.tokens.len())?;
+            self.token_positions.get(index).copied()
+        }
 
-            // Count newlines in the processed text up to this position
-            self.tokens[0..position]
-                .iter()
-                .filter(|(kind, _)| *kind == NEWLINE)
-                .count()
-                + 1
+        /// Returns the 1-based line of the current token, or the line after
+        /// the last newline at the end of input.
+        fn current_line_number(&self) -> usize {
+            let offset = self
+                .current_token_position()
+                .map_or(self.original_text.len(), |(start, _)| usize::from(start));
+            self.original_text[..offset].matches('\n').count() + 1
         }
 
         fn get_context_for_line(&self, line_number: usize) -> String {
@@ -736,23 +740,47 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Handle `override` and `export` prefixes (in either order). Both
             // are independent modifiers on a variable assignment.
             self.skip_ws();
-            for _ in 0..2 {
-                if self.current() == Some(IDENTIFIER)
-                    && matches!(
-                        self.tokens.last().unwrap().1.as_str(),
-                        "export" | "override"
-                    )
-                {
-                    self.bump();
-                    self.skip_ws();
-                } else {
+            // Only a line *leading* with `export` or `unexport` may name a list
+            // of already assigned variables. GNU Make rejects `override export
+            // FOO BAR` with "missing separator", so the first keyword decides,
+            // not the mere presence of `export` among the prefixes.
+            //
+            // `unexport` takes the same shapes as `export` in GNU Make 4.4.1,
+            // including an assignment, but only in the leading position:
+            // `override unexport FOO` is a "missing separator" there too.
+            let mut leads_with_export = false;
+            for index in 0..2 {
+                let Some((IDENTIFIER, keyword)) = self.tokens.last() else {
+                    break;
+                };
+                let is_prefix = match keyword.as_str() {
+                    "export" | "override" => true,
+                    "unexport" => index == 0,
+                    _ => false,
+                };
+                // `unexport = 1` assigns a variable named `unexport`.
+                if !is_prefix || self.assignment_operator_follows() {
                     break;
                 }
+                if index == 0 {
+                    leads_with_export = matches!(keyword.as_str(), "export" | "unexport");
+                }
+                self.bump();
+                self.skip_ws();
             }
 
             // Parse variable name
+            let mut names_a_define = false;
             match self.current() {
-                Some(IDENTIFIER) => self.bump(),
+                Some(IDENTIFIER) => {
+                    // `export define FOO ... endef` is valid GNU Make, but the
+                    // name slot swallows the `define` keyword here, so what
+                    // follows is the block's name rather than a further export
+                    // name. Treating it as a name list would erase the only
+                    // signal that this line was not understood.
+                    names_a_define = self.tokens.last().is_some_and(|(_, text)| text == "define");
+                    self.bump();
+                }
                 Some(DOLLAR) => self.parse_variable_reference(),
                 _ => {
                     self.error("expected variable name".to_string());
@@ -760,6 +788,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     return;
                 }
             }
+            let allows_name_list = leads_with_export && !names_a_define;
 
             // Skip whitespace and parse operator
             self.skip_ws();
@@ -813,10 +842,63 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => {
                     // EOF after export VARNAME is fine
                 }
+                // `export A B C` exports several already-assigned variables,
+                // and `export A # why` may end in a comment after one name.
+                Some(IDENTIFIER | COMMENT) if allows_name_list => self.parse_export_name_list(),
+                // The list may equally begin on a continued line.
+                _ if allows_name_list && self.is_line_continuation() => {
+                    self.parse_export_name_list()
+                }
                 _ => self.error("expected assignment operator".to_string()),
             }
 
             self.builder.finish_node();
+        }
+
+        /// Report whether the first token after the current one, ignoring
+        /// whitespace, is an assignment operator.
+        fn assignment_operator_follows(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .skip(1)
+                .find(|(kind, _)| *kind != WHITESPACE)
+                .is_some_and(|(kind, text)| {
+                    *kind == OPERATOR
+                        && ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&text.as_str())
+                })
+        }
+
+        /// Consume the remaining names of an `export` directive.
+        ///
+        /// The keyword and the first name are already consumed. Every further
+        /// name is kept as a token of the same VARIABLE node so that consumers
+        /// can recover the complete list, while `VariableDefinition::name()`
+        /// keeps reporting the first name and stays backwards compatible.
+        ///
+        /// The names are therefore the node's direct IDENTIFIER tokens with
+        /// the leading `export` and `override` keywords skipped, exactly as
+        /// `VariableDefinition::name()` skips them to find the first.
+        fn parse_export_name_list(&mut self) {
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.current() {
+                    Some(IDENTIFIER | WHITESPACE | COMMENT) => self.bump(),
+                    Some(NEWLINE) => {
+                        self.bump();
+                        break;
+                    }
+                    None => break,
+                    _ => {
+                        // Distinct from the missing-first-name message so a
+                        // consumer can tell the two positions apart.
+                        self.error("expected variable name in export list".to_string());
+                        break;
+                    }
+                }
+            }
         }
 
         fn parse_variable_reference(&mut self) {
@@ -1263,10 +1345,79 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Check if this could be a variable assignment
             if self.is_assignment_line() {
                 self.parse_assignment();
+            } else if self.is_expansion_line() {
+                self.parse_expansion();
             } else {
                 // Try to handle as a rule
                 self.parse_rule();
             }
+        }
+
+        /// Returns true if the logical line at the cursor is a bare expansion:
+        /// it starts with `$` and carries no operator outside a reference, so
+        /// it is neither a rule (no `:`) nor an assignment.
+        ///
+        /// GNU Make expands such a line and parses the result, so
+        /// `$(info ...)` and `$(error ...)` read as nothing while
+        /// `$(eval ...)` or a bare `$(VAR)` may define a rule or a variable.
+        /// The parser cannot expand it, so it keeps the line as its own item
+        /// rather than inventing a rule with no `:`.
+        fn is_expansion_line(&self) -> bool {
+            if self.current() != Some(DOLLAR) {
+                return false;
+            }
+            // GNU Make balances only the delimiter a reference opened with, so
+            // a literal `)` inside `${...}` or `{` inside `$(...)` is text. A
+            // stack of open references, each with its own delimiter pair and
+            // depth, keeps a nested `${...}` from closing its `$(...)` parent.
+            let mut references: Vec<(SyntaxKind, SyntaxKind, usize)> = Vec::new();
+            let mut previous = None;
+            let mut escaped = false;
+            for (kind, _) in self.tokens.iter().rev() {
+                if *kind == NEWLINE && !escaped {
+                    return true;
+                }
+                let opens_reference = previous == Some(DOLLAR);
+                match (*kind, references.last_mut()) {
+                    (LPAREN, _) if opens_reference => references.push((LPAREN, RPAREN, 1)),
+                    (LBRACE, _) if opens_reference => references.push((LBRACE, RBRACE, 1)),
+                    (k, Some(top)) if k == top.0 => top.2 += 1,
+                    (k, Some(top)) if k == top.1 => {
+                        top.2 -= 1;
+                        if top.2 == 0 {
+                            references.pop();
+                        }
+                    }
+                    (OPERATOR, None) => return false,
+                    _ => {}
+                }
+                previous = Some(*kind);
+                // Same parity rule as `pending_backslash_escape`.
+                escaped = *kind == BACKSLASH && !escaped;
+            }
+            true
+        }
+
+        /// Parse a bare expansion line into an `EXPANSION` node, one `EXPR`
+        /// child per reference, through its trailing newline and across any
+        /// line continuations.
+        fn parse_expansion(&mut self) {
+            self.builder.start_node(EXPANSION.into());
+            loop {
+                match self.current() {
+                    None => break,
+                    Some(NEWLINE) => {
+                        self.bump();
+                        break;
+                    }
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(BACKSLASH) if self.is_line_continuation() => {
+                        self.consume_line_continuation();
+                    }
+                    Some(_) => self.bump(),
+                }
+            }
+            self.builder.finish_node();
         }
 
         fn parse_include(&mut self) {
@@ -1596,7 +1747,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
+                    IDENTIFIER if matches!(text.as_str(), "export" | "unexport" | "override") => {
+                        seen_directive = true
+                    }
                     IDENTIFIER if !seen_identifier => seen_identifier = true,
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
                         return seen_identifier || seen_directive
@@ -1619,9 +1772,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // other token clears it. See `pending_backslash_escape`.
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
             self.builder.token(kind.into(), text.as_str());
-            if self.current_token_index > 0 {
-                self.current_token_index -= 1;
-            }
         }
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
@@ -1745,7 +1895,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         position = end;
     }
 
-    let current_token_index = tokens.len().saturating_sub(1);
     tokens.reverse();
     Parser {
         tokens,
@@ -1753,7 +1902,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         errors: Vec::new(),
         positioned_errors: Vec::new(),
         token_positions,
-        current_token_index,
         original_text: text.to_string(),
         variant,
         pending_backslash_escape: false,
@@ -1892,6 +2040,7 @@ ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
 ast_node!(Vpath, VPATH);
+ast_node!(Expansion, EXPANSION);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
@@ -3052,6 +3201,470 @@ rule: dependency
     }
 
     #[test]
+    fn test_parse_export_name_list() {
+        const EXPORT: &str = r#"export FOO BAR BAZ
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..19
+  VARIABLE@0..19
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+    WHITESPACE@14..15 " "
+    IDENTIFIER@15..18 "BAZ"
+    NEWLINE@18..19 "\n"
+"#
+        );
+
+        let root = parsed.root();
+
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        // `name()` keeps reporting the first name, so existing consumers are
+        // unaffected by the additional names now retained in the node.
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), None);
+        assert!(variable.is_export());
+    }
+
+    /// The names a directive line carries, as a consumer recovers them: the
+    /// node's direct identifier tokens.
+    fn export_identifier_tokens(text: &str) -> Vec<String> {
+        let parsed = parse(text, None);
+        let root = parsed.root();
+        let variable = root.variable_definitions().next().unwrap();
+        variable
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == IDENTIFIER)
+            .map(|token| token.text().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_export_name_list_identifier_tokens() {
+        // The contract consumers rely on: every name is a direct identifier
+        // token of the node, behind the leading keywords.
+        assert_eq!(
+            export_identifier_tokens("export FOO BAR BAZ\n"),
+            vec!["export", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_parse_override_export_name_list_errors() {
+        // GNU Make rejects `override export FOO BAR` with "missing separator";
+        // only a line leading with `export` may name a list.
+        const EXPORT: &str = r#"override export FOO BAR
+"#;
+        let parsed = parse(EXPORT, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_export_override_name_list() {
+        // GNU Make accepts this, reading `override` as one of the exported
+        // names rather than as a modifier.
+        const EXPORT: &str = r#"export override FOO
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_exported_define_is_unchanged() {
+        // `export define FOO ... endef` is valid GNU Make, but the name slot
+        // swallows `define`, so `FOO` is the block's name and not a further
+        // export name. The directive-list path must not fire and erase the
+        // diagnostic that says so.
+        const EXPORT: &str = r#"export define FOO
+body
+endef
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.message == "expected assignment operator"),
+            "{:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_at_eof() {
+        const EXPORT: &str = "export FOO BAR";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..14
+  VARIABLE@0..14
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_with_comment() {
+        const EXPORT: &str = r#"export FOO BAR # why
+"#;
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..21
+  VARIABLE@0..21
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "FOO"
+    WHITESPACE@10..11 " "
+    IDENTIFIER@11..14 "BAR"
+    WHITESPACE@14..15 " "
+    COMMENT@15..20 "# why"
+    NEWLINE@20..21 "\n"
+"##
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_continued_before_first_extra_name() {
+        // The continuation may come before any further name, which the first
+        // implementation rejected.
+        const EXPORT: &str = "export FOO \\\n\tBAR BAZ\n";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            export_identifier_tokens(EXPORT),
+            vec!["export", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_parse_export_name_list_continued_after_first_extra_name() {
+        const EXPORT: &str = "export FOO BAR \\\n\tBAZ\n";
+        let parsed = parse(EXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            export_identifier_tokens(EXPORT),
+            vec!["export", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_export_name_list_round_trips() {
+        // Losslessness is the crate's core promise, so every shape the new
+        // path can take must reproduce its input exactly.
+        for text in [
+            "export FOO BAR BAZ\n",
+            "export FOO BAR",
+            "export FOO BAR # why\n",
+            "export FOO \\\n\tBAR\n",
+            "export override FOO\n",
+            "override export FOO BAR\n",
+            "export FOO BAR := baz\n",
+            "export define FOO\nbody\nendef\n",
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_name_list_without_directive_still_errors() {
+        // Only a directive line may name several variables. Without a leading
+        // keyword the line is not treated as an assignment at all — it is a
+        // rule missing its colon — so accepting name lists after `export` must
+        // not make `FOO BAR` parse cleanly.
+        const INVALID: &str = r#"FOO BAR
+"#;
+        let parsed = parse(INVALID, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected ':'".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_override_without_export_still_errors() {
+        // This is the case that exercises the gate: `override` reaches
+        // `parse_assignment` as a directive prefix, but only `export` licenses
+        // a name list, and GNU Make rejects this line too.
+        const INVALID: &str = r#"override FOO BAR
+"#;
+        let parsed = parse(INVALID, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_bare_unexport() {
+        // `unexport NAME` is a directive like `export NAME`, not a rule
+        // missing its colon.
+        const UNEXPORT: &str = "FOO = 1\nunexport FOO\n";
+        let parsed = parse(UNEXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert!(parsed.positioned_errors.is_empty());
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..21
+  VARIABLE@0..8
+    IDENTIFIER@0..3 "FOO"
+    WHITESPACE@3..4 " "
+    OPERATOR@4..5 "="
+    WHITESPACE@5..6 " "
+    EXPR@6..7
+      IDENTIFIER@6..7 "1"
+    NEWLINE@7..8 "\n"
+  VARIABLE@8..21
+    IDENTIFIER@8..16 "unexport"
+    WHITESPACE@16..17 " "
+    IDENTIFIER@17..20 "FOO"
+    NEWLINE@20..21 "\n"
+"#
+        );
+
+        let root = parsed.root();
+        let variable = root.variable_definitions().nth(1).unwrap();
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), None);
+        assert!(variable.is_unexport());
+        assert!(!variable.is_export());
+        assert_eq!(root.rules().count(), 0);
+    }
+
+    #[test]
+    fn test_parse_unexport_name_list() {
+        const UNEXPORT: &str = "unexport FOO BAR BAZ\n";
+        let parsed = parse(UNEXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(
+            export_identifier_tokens(UNEXPORT),
+            vec!["unexport", "FOO", "BAR", "BAZ"]
+        );
+    }
+
+    #[test]
+    fn test_parse_unexport_assignment() {
+        // GNU Make 4.4.1 assigns and unexports here, exactly as `export`
+        // would assign and export.
+        const UNEXPORT: &str = "unexport FOO = 3\n";
+        let parsed = parse(UNEXPORT, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let variable = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(variable.name(), Some("FOO".to_string()));
+        assert_eq!(variable.raw_value(), Some("3".to_string()));
+        assert!(variable.is_unexport());
+    }
+
+    #[test]
+    fn test_parse_override_unexport_errors() {
+        // GNU Make rejects `override unexport FOO` with "missing separator":
+        // `unexport` is a directive only in the leading position.
+        let parsed = parse("override unexport FOO\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unexport_after_assignments_parses_complete() {
+        // Before `unexport` was a directive, both files reported two
+        // `expected ':'` errors, neither on the `unexport` line: one on an
+        // earlier assignment and one a line past the end of the file.
+        for text in [
+            "A = 1\nB = 2\nC = 3\nunexport C\n",
+            "A = 1\nB = 2\nC = 3\nunexport C\n\nall:\n\techo done\n",
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            assert!(parsed.positioned_errors.is_empty(), "input {text:?}");
+            assert_eq!(parsed.root().variable_definitions().count(), 4);
+        }
+    }
+
+    #[test]
+    fn test_directive_keyword_as_variable_name() {
+        // GNU Make 4.4.1 reads a keyword directly followed by an assignment
+        // operator as the variable's name, not as a directive.
+        for (text, name, value) in [
+            ("unexport = 1\n", "unexport", "1"),
+            ("export = 2\n", "export", "2"),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(variable.name(), Some(name.to_string()), "input {text:?}");
+            assert_eq!(
+                variable.raw_value(),
+                Some(value.to_string()),
+                "input {text:?}"
+            );
+            assert!(!variable.is_unexport(), "input {text:?}");
+            assert!(!variable.is_export(), "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_keyword_in_a_name_list_is_a_name() {
+        // A directive keyword later on the line is one of the names, so it
+        // must not set the flag of the directive it spells: GNU Make 4.4.1
+        // unexports a variable called `export` on the first line and exports
+        // one called `override` on the second.
+        for (text, name, (is_export, is_unexport, is_override)) in [
+            ("unexport FOO export\n", "FOO", (false, true, false)),
+            ("export FOO override\n", "FOO", (true, false, false)),
+            ("unexport export FOO = 3\n", "FOO", (true, true, false)),
+            // The parser takes at most two prefixes, so a third keyword is
+            // the name.
+            ("export export override\n", "override", (true, false, false)),
+            // A keyword directly before the operator is the name too.
+            ("export override = 1\n", "override", (true, false, false)),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(
+                (
+                    variable.is_export(),
+                    variable.is_unexport(),
+                    variable.is_override()
+                ),
+                (is_export, is_unexport, is_override),
+                "input {text:?}"
+            );
+            assert_eq!(variable.name(), Some(name.to_string()), "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_name_less_unexport() {
+        // A bare `unexport` is valid GNU Make, but it names no variable. The
+        // node reports the directive and no name, so a consumer can tell it
+        // from `unexport = 1`.
+        let parsed = parse("unexport\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["expected variable name".to_string()]
+        );
+        let variable = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(variable.name(), None);
+        assert!(variable.is_unexport());
+    }
+
+    #[test]
+    fn test_unexport_as_a_directive_name() {
+        // `unexport` is a directive only when it leads the line. After another
+        // keyword, or after itself, it is the name of the variable concerned.
+        for (text, is_unexport) in [("export unexport\n", false), ("unexport unexport\n", true)] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(
+                variable.name(),
+                Some("unexport".to_string()),
+                "input {text:?}"
+            );
+            assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_single_name_directive_with_a_trailing_comment() {
+        // GNU Make 4.4.1 accepts a comment after one exported or unexported
+        // name. The parser used to report a missing assignment operator here,
+        // after `export` as well as after `unexport`.
+        for (text, is_unexport) in [
+            ("FOO = 1\nexport FOO # why\n", false),
+            ("FOO = 1\nunexport FOO # why\n", true),
+        ] {
+            let parsed = parse(text, None);
+            assert!(
+                parsed.errors.is_empty(),
+                "input {text:?}: {:?}",
+                parsed.errors
+            );
+            let variable = parsed.root().variable_definitions().nth(1).unwrap();
+            assert_eq!(variable.name(), Some("FOO".to_string()), "input {text:?}");
+            assert_eq!(variable.is_unexport(), is_unexport, "input {text:?}");
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_unexport_round_trips() {
+        for text in [
+            "unexport FOO\n",
+            "unexport FOO",
+            "unexport FOO BAR # why\n",
+            "unexport FOO \\\n\tBAR\n",
+            "unexport FOO = 3\n",
+            "override unexport FOO\n",
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.syntax().text().to_string(), text, "input {text:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_multiple_prerequisites() {
         const MULTIPLE_PREREQUISITES: &str = r#"rule: dependency1 dependency2
 	command
@@ -3362,14 +3975,14 @@ build-indep: build
         let parsed = parse(input, None);
         let direct_error = &parsed.errors[0];
 
-        // Verify error is detected with correct details
-        assert_eq!(direct_error.line, 2);
+        // The colon is missing from line 1, so that is the line reported.
+        assert_eq!(direct_error.line, 1);
         assert!(
             direct_error.message.contains("expected"),
             "Error message should contain 'expected': {}",
             direct_error.message
         );
-        assert_eq!(direct_error.context, "\tcommand");
+        assert_eq!(direct_error.context, "rule target");
 
         // Check public API
         let reader_result = Makefile::from_reader(input.as_bytes());
@@ -3383,8 +3996,8 @@ build-indep: build
 
         // Verify formatting includes line number and context
         let error_text = parse_error.to_string();
-        assert!(error_text.contains("Error at line 2:"));
-        assert!(error_text.contains("2| \tcommand"));
+        assert!(error_text.contains("Error at line 1:"));
+        assert!(error_text.contains("1| rule target"));
     }
 
     #[test]
@@ -3436,7 +4049,8 @@ build-indep: build
     fn test_line_number_calculation() {
         // Test inputs for various error locations
         let test_cases = [
-            ("rule dependency\n\tcommand", 2),             // Missing colon
+            ("rule dependency\n\tcommand", 1),             // Missing colon
+            ("a := 1\nrule target\nb := 2\n\n", 2),        // Missing colon mid-file, not at EOF
             ("#comment\n\t(╯°□°)╯︵ ┻━┻", 2),              // Strange characters
             ("var = value\n#comment\n\tindented line", 3), // Indented line not part of a rule
         ];
@@ -8299,5 +8913,194 @@ mod test_continuation {
                 "round-trip mismatch for {src:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod test_expansion {
+    //! Bare expansion lines and the line each parse error reports.
+
+    use super::*;
+    use crate::ast::makefile::MakefileItem;
+
+    /// Returns the top-level items of `src`, asserting it parses cleanly.
+    fn clean_items(src: &str) -> Vec<MakefileItem> {
+        let parsed = parse(src, None);
+        assert!(
+            parsed.errors.is_empty(),
+            "errors for {src:?}: {:?}",
+            parsed.errors
+        );
+        assert!(
+            parsed.positioned_errors.is_empty(),
+            "positioned errors for {src:?}: {:?}",
+            parsed.positioned_errors
+        );
+        let makefile = parsed.root();
+        assert_eq!(makefile.to_string(), src, "round-trip mismatch for {src:?}");
+        makefile.items().collect()
+    }
+
+    #[test]
+    fn test_bare_expansion_lines_are_expansion_items() {
+        // GNU Make 4.4.1 expands each of these lines and parses the result;
+        // none of them is a rule, so none may come back as one.
+        let cases = [
+            ("$(info hello)\n", "info"),
+            ("$(warning careful)\n", "warning"),
+            ("$(error KANI_VERSION must be MAJOR.MINOR.PATCH)\n", "error"),
+            ("$(eval E := evaluated)\n", "eval"),
+            ("$(call define-rule,target)\n", "call"),
+            ("$(RULES)\n", "RULES"),
+            ("${RULES}\n", "RULES"),
+            ("$(info no trailing newline)", "info"),
+        ];
+        for (src, name) in cases {
+            let items = clean_items(src);
+            assert_eq!(items.len(), 1, "one item for {src:?}");
+            let MakefileItem::Expansion(line) = &items[0] else {
+                panic!("{src:?} did not parse as an expansion line");
+            };
+            let names: Vec<_> = line.references().filter_map(|r| r.name()).collect();
+            assert_eq!(names, [name], "reference names for {src:?}");
+        }
+    }
+
+    #[test]
+    fn test_guarded_error_is_not_a_rule() {
+        let src = concat!(
+            "FOO := 1\n",
+            "ifneq ($(FOO),1)\n",
+            "$(error FOO must be 1)\n",
+            "endif\n",
+            "BAR := 1\n",
+            "\n",
+            "all:\n",
+            "\t@echo $(FOO)\n",
+        );
+        let items = clean_items(src);
+        let makefile = parse(src, None).root();
+        assert_eq!(makefile.rules().count(), 1, "only `all` is a rule");
+        let conditional = items
+            .iter()
+            .find_map(|item| match item {
+                MakefileItem::Conditional(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("the ifneq block");
+        let guarded: Vec<_> = conditional.if_items().collect();
+        assert!(
+            matches!(guarded.as_slice(), [MakefileItem::Expansion(_)]),
+            "the guarded line is an expansion"
+        );
+    }
+
+    #[test]
+    fn test_rules_and_assignments_with_expansions_are_unchanged() {
+        // A colon or assignment operator outside the references keeps the
+        // existing reading of the line.
+        for src in [
+            "$(OUT): in\n",
+            "$(OUT) : in\n",
+            "$(OUT):: in\n",
+            "$(OUT) \\\n  : in\n",
+        ] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Rule(_)]),
+                "{src:?} is a rule"
+            );
+        }
+        for src in ["$(NAME) = value\n", "$(NAME) += value\n"] {
+            let parsed = parse(src, None);
+            assert!(
+                !parsed
+                    .root()
+                    .items()
+                    .any(|item| matches!(item, MakefileItem::Expansion(_))),
+                "{src:?} is not an expansion line"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_literal_of_the_other_delimiter_does_not_change_nesting() {
+        // A `)` inside `${...}` is text, so the colon stays inside the
+        // reference and the line is a bare expansion, not a rule.
+        for src in ["${info ):}\n", "$(info }:)\n", "$(info {:)\n"] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Expansion(_)]),
+                "{src:?} is an expansion"
+            );
+        }
+        // An unmatched `{` inside `$(...)` does not hide the external colon.
+        let items = clean_items("$(addprefix {,foo): dep\n");
+        assert!(
+            matches!(items.as_slice(), [MakefileItem::Rule(_)]),
+            "the colon after the reference makes a rule"
+        );
+    }
+
+    #[test]
+    fn test_mixed_delimiters_nest_as_separate_references() {
+        // The `)` inside the nested `${...}` is text, so it must not close
+        // the outer `$(...)` and expose the colon that still belongs to it.
+        for src in ["$(info ${foo):bar})\n", "${info $(foo}:bar)}\n"] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Expansion(_)]),
+                "{src:?} is an expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn test_colon_inside_a_reference_does_not_make_a_rule() {
+        let items = clean_items("$(eval target: prerequisite)\nX := 1\n");
+        assert!(matches!(
+            items.as_slice(),
+            [MakefileItem::Expansion(_), MakefileItem::Variable(_)]
+        ));
+    }
+
+    #[test]
+    fn test_expansion_line_continues_across_backslash_newline() {
+        let items = clean_items("$(info a) \\\n  $(info b)\nX := 1\n");
+        let [MakefileItem::Expansion(line), MakefileItem::Variable(_)] = items.as_slice() else {
+            panic!("expected one continued expansion line then a variable");
+        };
+        assert_eq!(line.references().count(), 2);
+    }
+
+    #[test]
+    fn test_escaped_backslash_ends_the_expansion_line() {
+        // `\\` is a literal backslash, so the newline after it ends the line.
+        let items = clean_items("$(info a) \\\\\nX := 1\n");
+        assert!(matches!(
+            items.as_slice(),
+            [MakefileItem::Expansion(_), MakefileItem::Variable(_)]
+        ));
+    }
+
+    #[test]
+    fn test_positioned_error_points_at_the_offending_line() {
+        // The positioned range once came from a mirrored token index, so an
+        // error on line 2 of 5 was reported in another line entirely.
+        let src = "a := 1\nrule target\nb := 2\nc := 3\nd := 4\n";
+        let parsed = parse(src, None);
+        let error = parsed
+            .positioned_errors
+            .first()
+            .expect("a missing-colon error");
+        let line_two = 7..19;
+        let start = usize::from(error.range.start());
+        assert!(
+            line_two.contains(&start),
+            "error range {:?} is outside line 2 ({line_two:?})",
+            error.range
+        );
+        assert_eq!(parsed.errors[0].line, 2);
+        assert_eq!(parsed.errors[0].context, "rule target");
     }
 }

@@ -22,20 +22,65 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 
 impl VariableDefinition {
     /// Get the name of the variable definition
+    ///
+    /// The name is the identifier the parser read in the name slot: the one
+    /// after the directive keywords it consumed as prefixes, and after a
+    /// `define` keyword. A keyword later on the line is a name, as in
+    /// `export export override`, and a keyword that is the only identifier of
+    /// an assignment is the variable's name: `unexport = 1` assigns a variable
+    /// named `unexport`.
     pub fn name(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            it.as_token().and_then(|it| {
-                if it.kind() == IDENTIFIER
-                    && it.text() != "export"
-                    && it.text() != "override"
-                    && it.text() != "define"
-                {
-                    Some(it.text().to_string())
-                } else {
-                    None
-                }
+        let index = self.name_index()?;
+        self.identifiers().into_iter().nth(index)
+    }
+
+    /// The position of the name among the definition's identifier tokens.
+    fn name_index(&self) -> Option<usize> {
+        let identifiers = self.identifiers();
+        if identifiers.len() == 1 && self.assignment_operator().is_some() {
+            return Some(0);
+        }
+        let mut index = self.directive_prefixes().len();
+        if identifiers.get(index).is_some_and(|text| text == "define") {
+            index += 1;
+        }
+        (index < identifiers.len()).then_some(index)
+    }
+
+    /// The definition's direct identifier tokens, keywords included.
+    fn identifiers(&self) -> Vec<String> {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|token| token.kind() == IDENTIFIER)
+            .map(|token| token.text().to_string())
+            .collect()
+    }
+
+    /// The directive keywords leading the definition, in source order.
+    ///
+    /// These mirror the tokens the parser consumes as prefixes: at most two
+    /// of `export` and `override`, or `unexport` in the first position. A
+    /// keyword that the last identifier of an assignment spells is the
+    /// variable's name rather than a prefix, as in `export override = 1`.
+    fn directive_prefixes(&self) -> Vec<String> {
+        let identifiers = self.identifiers();
+        let limit = if self.assignment_operator().is_some() {
+            identifiers.len().saturating_sub(1)
+        } else {
+            identifiers.len()
+        };
+        identifiers
+            .into_iter()
+            .take(limit.min(2))
+            .enumerate()
+            .take_while(|(index, text)| match text.as_str() {
+                "export" | "override" => true,
+                "unexport" => *index == 0,
+                _ => false,
             })
-        })
+            .map(|(_, text)| text)
+            .collect()
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -47,16 +92,44 @@ impl VariableDefinition {
     }
 
     /// Check if this variable definition is exported
+    ///
+    /// Only a leading `export` keyword counts: `export = 1` assigns a
+    /// variable called `export`, and `unexport FOO export` unexports a
+    /// variable called `export`.
     pub fn is_export(&self) -> bool {
-        self.syntax()
-            .children_with_tokens()
-            .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+        self.directive_prefixes()
+            .iter()
+            .any(|prefix| prefix == "export")
+    }
+
+    /// Check if this variable definition is an `unexport` directive
+    ///
+    /// `unexport FOO` keeps a previously exported variable out of the
+    /// environment of recipe commands. Only a leading `unexport` is the
+    /// directive: `export unexport` exports a variable called `unexport`, and
+    /// `unexport = 1` assigns one. A bare `unexport` with no names is the
+    /// directive too.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "FOO = 1\nunexport FOO\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().nth(1).unwrap();
+    /// assert!(var.is_unexport());
+    /// assert!(!var.is_export());
+    /// assert_eq!(var.name(), Some("FOO".to_string()));
+    /// ```
+    pub fn is_unexport(&self) -> bool {
+        self.directive_prefixes()
+            .first()
+            .is_some_and(|prefix| prefix == "unexport")
     }
 
     /// Check if this variable definition uses the `override` directive
     ///
     /// `override FOO = bar` makes the assignment take precedence over any
-    /// value passed on the make command line.
+    /// value passed on the make command line. Only a leading `override`
+    /// keyword counts: in `export FOO override`, `override` is a name.
     ///
     /// # Example
     /// ```
@@ -67,10 +140,9 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("CC".to_string()));
     /// ```
     pub fn is_override(&self) -> bool {
-        self.syntax().children_with_tokens().any(|it| {
-            it.as_token()
-                .is_some_and(|token| token.text() == "override")
-        })
+        self.directive_prefixes()
+            .iter()
+            .any(|prefix| prefix == "override")
     }
 
     /// Get the assignment operator/flavor used in this variable definition
@@ -201,9 +273,9 @@ impl VariableDefinition {
     /// Rename the variable, preserving the operator, value and any
     /// `export`/`override`/`define` prefix.
     ///
-    /// The name is the first IDENTIFIER token that is not a directive
-    /// keyword (the same token [`Self::name`] returns). A no-op if the
-    /// definition has no such token.
+    /// The name is the token [`Self::name`] returns, so the directive
+    /// keywords before it, including a leading `unexport`, are kept. A no-op
+    /// if the definition has no name.
     ///
     /// # Example
     /// ```
@@ -218,18 +290,21 @@ impl VariableDefinition {
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
 
+        let Some(name_index) = self.name_index() else {
+            return;
+        };
         let mut renamed = false;
+        let mut identifier_index = 0;
         for child in self.syntax().children_with_tokens() {
             match child {
-                rowan::NodeOrToken::Token(token)
-                    if !renamed
-                        && token.kind() == IDENTIFIER
-                        && token.text() != "export"
-                        && token.text() != "override"
-                        && token.text() != "define" =>
-                {
-                    builder.token(IDENTIFIER.into(), new_name);
-                    renamed = true;
+                rowan::NodeOrToken::Token(token) if token.kind() == IDENTIFIER => {
+                    if identifier_index == name_index {
+                        builder.token(IDENTIFIER.into(), new_name);
+                        renamed = true;
+                    } else {
+                        builder.token(token.kind().into(), token.text());
+                    }
+                    identifier_index += 1;
                 }
                 rowan::NodeOrToken::Token(token) => {
                     builder.token(token.kind().into(), token.text());
@@ -528,6 +603,37 @@ mod tests {
         var.set_name("BAZ");
         assert!(var.is_override());
         assert_eq!(makefile.code(), "override  BAZ  :=  bar\n");
+    }
+
+    #[test]
+    fn test_set_name_keeps_the_unexport_directive() {
+        // Review found `set_name` renaming the `unexport` keyword itself.
+        let makefile: Makefile = "unexport FOO\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("BAR");
+        assert!(var.is_unexport());
+        assert_eq!(var.name(), Some("BAR".to_string()));
+        assert_eq!(makefile.code(), "unexport BAR\n");
+    }
+
+    #[test]
+    fn test_set_name_renames_a_keyword_named_variable() {
+        // The third keyword is the name; the two prefixes stay.
+        let makefile: Makefile = "export export override\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("BAR");
+        assert_eq!(makefile.code(), "export export BAR\n");
+    }
+
+    #[test]
+    fn test_define_block_name_follows_the_keyword() {
+        // `define` sits in the name slot's place, so the name is the next
+        // identifier, and renaming keeps the keyword.
+        let makefile: Makefile = "define FOO\nbody\nendef\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("FOO".to_string()));
+        var.set_name("BAR");
+        assert_eq!(makefile.code(), "define BAR\nbody\nendef\n");
     }
 
     #[test]
