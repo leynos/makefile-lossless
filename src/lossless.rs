@@ -133,8 +133,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         positioned_errors: Vec<PositionedParseError>,
         /// Token positions (start, end) in forward order, indexed by forward token index
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
-        /// current token index into token_positions (counting from the end since tokens are in reverse)
-        current_token_index: usize,
         /// The original text
         original_text: String,
         /// The makefile variant
@@ -170,7 +168,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     (tab_line, lines[tab_line - 1].to_string())
                 }
             } else {
-                let line = self.get_line_number_for_position(self.tokens.len());
+                let line = self.current_line_number();
                 (line, self.get_context_for_line(line))
             };
 
@@ -200,8 +198,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Add a positioned error at the current token position
         fn add_positioned_error(&mut self, message: String, code: Option<String>) {
-            let range = if self.current_token_index < self.token_positions.len() {
-                let (start, end) = self.token_positions[self.current_token_index];
+            let range = if let Some((start, end)) = self.current_token_position() {
                 rowan::TextRange::new(start, end)
             } else {
                 // Default to end of text if no current token
@@ -220,17 +217,24 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             });
         }
 
-        fn get_line_number_for_position(&self, position: usize) -> usize {
-            if position >= self.tokens.len() {
-                return self.original_text.matches('\n').count() + 1;
-            }
+        /// Returns the source range of the current token, or `None` at the
+        /// end of input.
+        ///
+        /// `tokens` is a stack holding the unconsumed tokens in reverse, and
+        /// `token_positions` lists every token in source order, so the
+        /// current token's source-order index is the number already consumed.
+        fn current_token_position(&self) -> Option<(rowan::TextSize, rowan::TextSize)> {
+            let index = self.token_positions.len().checked_sub(self.tokens.len())?;
+            self.token_positions.get(index).copied()
+        }
 
-            // Count newlines in the processed text up to this position
-            self.tokens[0..position]
-                .iter()
-                .filter(|(kind, _)| *kind == NEWLINE)
-                .count()
-                + 1
+        /// Returns the 1-based line of the current token, or the line after
+        /// the last newline at the end of input.
+        fn current_line_number(&self) -> usize {
+            let offset = self
+                .current_token_position()
+                .map_or(self.original_text.len(), |(start, _)| usize::from(start));
+            self.original_text[..offset].matches('\n').count() + 1
         }
 
         fn get_context_for_line(&self, line_number: usize) -> String {
@@ -1341,10 +1345,79 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Check if this could be a variable assignment
             if self.is_assignment_line() {
                 self.parse_assignment();
+            } else if self.is_expansion_line() {
+                self.parse_expansion();
             } else {
                 // Try to handle as a rule
                 self.parse_rule();
             }
+        }
+
+        /// Returns true if the logical line at the cursor is a bare expansion:
+        /// it starts with `$` and carries no operator outside a reference, so
+        /// it is neither a rule (no `:`) nor an assignment.
+        ///
+        /// GNU Make expands such a line and parses the result, so
+        /// `$(info ...)` and `$(error ...)` read as nothing while
+        /// `$(eval ...)` or a bare `$(VAR)` may define a rule or a variable.
+        /// The parser cannot expand it, so it keeps the line as its own item
+        /// rather than inventing a rule with no `:`.
+        fn is_expansion_line(&self) -> bool {
+            if self.current() != Some(DOLLAR) {
+                return false;
+            }
+            // GNU Make balances only the delimiter a reference opened with, so
+            // a literal `)` inside `${...}` or `{` inside `$(...)` is text. A
+            // stack of open references, each with its own delimiter pair and
+            // depth, keeps a nested `${...}` from closing its `$(...)` parent.
+            let mut references: Vec<(SyntaxKind, SyntaxKind, usize)> = Vec::new();
+            let mut previous = None;
+            let mut escaped = false;
+            for (kind, _) in self.tokens.iter().rev() {
+                if *kind == NEWLINE && !escaped {
+                    return true;
+                }
+                let opens_reference = previous == Some(DOLLAR);
+                match (*kind, references.last_mut()) {
+                    (LPAREN, _) if opens_reference => references.push((LPAREN, RPAREN, 1)),
+                    (LBRACE, _) if opens_reference => references.push((LBRACE, RBRACE, 1)),
+                    (k, Some(top)) if k == top.0 => top.2 += 1,
+                    (k, Some(top)) if k == top.1 => {
+                        top.2 -= 1;
+                        if top.2 == 0 {
+                            references.pop();
+                        }
+                    }
+                    (OPERATOR, None) => return false,
+                    _ => {}
+                }
+                previous = Some(*kind);
+                // Same parity rule as `pending_backslash_escape`.
+                escaped = *kind == BACKSLASH && !escaped;
+            }
+            true
+        }
+
+        /// Parse a bare expansion line into an `EXPANSION` node, one `EXPR`
+        /// child per reference, through its trailing newline and across any
+        /// line continuations.
+        fn parse_expansion(&mut self) {
+            self.builder.start_node(EXPANSION.into());
+            loop {
+                match self.current() {
+                    None => break,
+                    Some(NEWLINE) => {
+                        self.bump();
+                        break;
+                    }
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(BACKSLASH) if self.is_line_continuation() => {
+                        self.consume_line_continuation();
+                    }
+                    Some(_) => self.bump(),
+                }
+            }
+            self.builder.finish_node();
         }
 
         fn parse_include(&mut self) {
@@ -1699,9 +1772,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // other token clears it. See `pending_backslash_escape`.
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
             self.builder.token(kind.into(), text.as_str());
-            if self.current_token_index > 0 {
-                self.current_token_index -= 1;
-            }
         }
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
@@ -1825,7 +1895,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         position = end;
     }
 
-    let current_token_index = tokens.len().saturating_sub(1);
     tokens.reverse();
     Parser {
         tokens,
@@ -1833,7 +1902,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         errors: Vec::new(),
         positioned_errors: Vec::new(),
         token_positions,
-        current_token_index,
         original_text: text.to_string(),
         variant,
         pending_backslash_escape: false,
@@ -1972,6 +2040,7 @@ ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
 ast_node!(Vpath, VPATH);
+ast_node!(Expansion, EXPANSION);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
@@ -3906,14 +3975,14 @@ build-indep: build
         let parsed = parse(input, None);
         let direct_error = &parsed.errors[0];
 
-        // Verify error is detected with correct details
-        assert_eq!(direct_error.line, 2);
+        // The colon is missing from line 1, so that is the line reported.
+        assert_eq!(direct_error.line, 1);
         assert!(
             direct_error.message.contains("expected"),
             "Error message should contain 'expected': {}",
             direct_error.message
         );
-        assert_eq!(direct_error.context, "\tcommand");
+        assert_eq!(direct_error.context, "rule target");
 
         // Check public API
         let reader_result = Makefile::from_reader(input.as_bytes());
@@ -3927,8 +3996,8 @@ build-indep: build
 
         // Verify formatting includes line number and context
         let error_text = parse_error.to_string();
-        assert!(error_text.contains("Error at line 2:"));
-        assert!(error_text.contains("2| \tcommand"));
+        assert!(error_text.contains("Error at line 1:"));
+        assert!(error_text.contains("1| rule target"));
     }
 
     #[test]
@@ -3980,7 +4049,8 @@ build-indep: build
     fn test_line_number_calculation() {
         // Test inputs for various error locations
         let test_cases = [
-            ("rule dependency\n\tcommand", 2),             // Missing colon
+            ("rule dependency\n\tcommand", 1),             // Missing colon
+            ("a := 1\nrule target\nb := 2\n\n", 2),        // Missing colon mid-file, not at EOF
             ("#comment\n\t(╯°□°)╯︵ ┻━┻", 2),              // Strange characters
             ("var = value\n#comment\n\tindented line", 3), // Indented line not part of a rule
         ];
@@ -8843,5 +8913,194 @@ mod test_continuation {
                 "round-trip mismatch for {src:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod test_expansion {
+    //! Bare expansion lines and the line each parse error reports.
+
+    use super::*;
+    use crate::ast::makefile::MakefileItem;
+
+    /// Returns the top-level items of `src`, asserting it parses cleanly.
+    fn clean_items(src: &str) -> Vec<MakefileItem> {
+        let parsed = parse(src, None);
+        assert!(
+            parsed.errors.is_empty(),
+            "errors for {src:?}: {:?}",
+            parsed.errors
+        );
+        assert!(
+            parsed.positioned_errors.is_empty(),
+            "positioned errors for {src:?}: {:?}",
+            parsed.positioned_errors
+        );
+        let makefile = parsed.root();
+        assert_eq!(makefile.to_string(), src, "round-trip mismatch for {src:?}");
+        makefile.items().collect()
+    }
+
+    #[test]
+    fn test_bare_expansion_lines_are_expansion_items() {
+        // GNU Make 4.4.1 expands each of these lines and parses the result;
+        // none of them is a rule, so none may come back as one.
+        let cases = [
+            ("$(info hello)\n", "info"),
+            ("$(warning careful)\n", "warning"),
+            ("$(error KANI_VERSION must be MAJOR.MINOR.PATCH)\n", "error"),
+            ("$(eval E := evaluated)\n", "eval"),
+            ("$(call define-rule,target)\n", "call"),
+            ("$(RULES)\n", "RULES"),
+            ("${RULES}\n", "RULES"),
+            ("$(info no trailing newline)", "info"),
+        ];
+        for (src, name) in cases {
+            let items = clean_items(src);
+            assert_eq!(items.len(), 1, "one item for {src:?}");
+            let MakefileItem::Expansion(line) = &items[0] else {
+                panic!("{src:?} did not parse as an expansion line");
+            };
+            let names: Vec<_> = line.references().filter_map(|r| r.name()).collect();
+            assert_eq!(names, [name], "reference names for {src:?}");
+        }
+    }
+
+    #[test]
+    fn test_guarded_error_is_not_a_rule() {
+        let src = concat!(
+            "FOO := 1\n",
+            "ifneq ($(FOO),1)\n",
+            "$(error FOO must be 1)\n",
+            "endif\n",
+            "BAR := 1\n",
+            "\n",
+            "all:\n",
+            "\t@echo $(FOO)\n",
+        );
+        let items = clean_items(src);
+        let makefile = parse(src, None).root();
+        assert_eq!(makefile.rules().count(), 1, "only `all` is a rule");
+        let conditional = items
+            .iter()
+            .find_map(|item| match item {
+                MakefileItem::Conditional(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("the ifneq block");
+        let guarded: Vec<_> = conditional.if_items().collect();
+        assert!(
+            matches!(guarded.as_slice(), [MakefileItem::Expansion(_)]),
+            "the guarded line is an expansion"
+        );
+    }
+
+    #[test]
+    fn test_rules_and_assignments_with_expansions_are_unchanged() {
+        // A colon or assignment operator outside the references keeps the
+        // existing reading of the line.
+        for src in [
+            "$(OUT): in\n",
+            "$(OUT) : in\n",
+            "$(OUT):: in\n",
+            "$(OUT) \\\n  : in\n",
+        ] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Rule(_)]),
+                "{src:?} is a rule"
+            );
+        }
+        for src in ["$(NAME) = value\n", "$(NAME) += value\n"] {
+            let parsed = parse(src, None);
+            assert!(
+                !parsed
+                    .root()
+                    .items()
+                    .any(|item| matches!(item, MakefileItem::Expansion(_))),
+                "{src:?} is not an expansion line"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_literal_of_the_other_delimiter_does_not_change_nesting() {
+        // A `)` inside `${...}` is text, so the colon stays inside the
+        // reference and the line is a bare expansion, not a rule.
+        for src in ["${info ):}\n", "$(info }:)\n", "$(info {:)\n"] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Expansion(_)]),
+                "{src:?} is an expansion"
+            );
+        }
+        // An unmatched `{` inside `$(...)` does not hide the external colon.
+        let items = clean_items("$(addprefix {,foo): dep\n");
+        assert!(
+            matches!(items.as_slice(), [MakefileItem::Rule(_)]),
+            "the colon after the reference makes a rule"
+        );
+    }
+
+    #[test]
+    fn test_mixed_delimiters_nest_as_separate_references() {
+        // The `)` inside the nested `${...}` is text, so it must not close
+        // the outer `$(...)` and expose the colon that still belongs to it.
+        for src in ["$(info ${foo):bar})\n", "${info $(foo}:bar)}\n"] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Expansion(_)]),
+                "{src:?} is an expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn test_colon_inside_a_reference_does_not_make_a_rule() {
+        let items = clean_items("$(eval target: prerequisite)\nX := 1\n");
+        assert!(matches!(
+            items.as_slice(),
+            [MakefileItem::Expansion(_), MakefileItem::Variable(_)]
+        ));
+    }
+
+    #[test]
+    fn test_expansion_line_continues_across_backslash_newline() {
+        let items = clean_items("$(info a) \\\n  $(info b)\nX := 1\n");
+        let [MakefileItem::Expansion(line), MakefileItem::Variable(_)] = items.as_slice() else {
+            panic!("expected one continued expansion line then a variable");
+        };
+        assert_eq!(line.references().count(), 2);
+    }
+
+    #[test]
+    fn test_escaped_backslash_ends_the_expansion_line() {
+        // `\\` is a literal backslash, so the newline after it ends the line.
+        let items = clean_items("$(info a) \\\\\nX := 1\n");
+        assert!(matches!(
+            items.as_slice(),
+            [MakefileItem::Expansion(_), MakefileItem::Variable(_)]
+        ));
+    }
+
+    #[test]
+    fn test_positioned_error_points_at_the_offending_line() {
+        // The positioned range once came from a mirrored token index, so an
+        // error on line 2 of 5 was reported in another line entirely.
+        let src = "a := 1\nrule target\nb := 2\nc := 3\nd := 4\n";
+        let parsed = parse(src, None);
+        let error = parsed
+            .positioned_errors
+            .first()
+            .expect("a missing-colon error");
+        let line_two = 7..19;
+        let start = usize::from(error.range.start());
+        assert!(
+            line_two.contains(&start),
+            "error range {:?} is outside line 2 ({line_two:?})",
+            error.range
+        );
+        assert_eq!(parsed.errors[0].line, 2);
+        assert_eq!(parsed.errors[0].context, "rule target");
     }
 }

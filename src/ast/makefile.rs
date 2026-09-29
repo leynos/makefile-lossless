@@ -1,6 +1,6 @@
 use crate::lossless::{
-    parse, Conditional, Error, ErrorInfo, Include, Makefile, ParseError, Rule, SyntaxNode,
-    VariableDefinition, VariableReference, Vpath,
+    parse, Conditional, Error, ErrorInfo, Expansion, Include, Makefile, ParseError, Rule,
+    SyntaxNode, VariableDefinition, VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
 use crate::SyntaxKind::*;
@@ -21,6 +21,8 @@ pub enum MakefileItem {
     Conditional(Conditional),
     /// A `vpath` directive (e.g., `vpath %.c src`)
     Vpath(Vpath),
+    /// A bare expansion line (e.g., `$(info ...)` or `$(eval ...)`)
+    Expansion(Expansion),
 }
 
 impl MakefileItem {
@@ -34,6 +36,8 @@ impl MakefileItem {
             Some(MakefileItem::Include(inc))
         } else if let Some(vp) = Vpath::cast(node.clone()) {
             Some(MakefileItem::Vpath(vp))
+        } else if let Some(expansion) = Expansion::cast(node.clone()) {
+            Some(MakefileItem::Expansion(expansion))
         } else {
             Conditional::cast(node).map(MakefileItem::Conditional)
         }
@@ -47,6 +51,7 @@ impl MakefileItem {
             MakefileItem::Include(i) => i.syntax(),
             MakefileItem::Conditional(c) => c.syntax(),
             MakefileItem::Vpath(v) => v.syntax(),
+            MakefileItem::Expansion(e) => e.syntax(),
         }
     }
 
