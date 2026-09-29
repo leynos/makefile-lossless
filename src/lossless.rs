@@ -1367,26 +1367,30 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return false;
             }
             // GNU Make balances only the delimiter a reference opened with, so
-            // a literal `)` inside `${...}` or `{` inside `$(...)` is text. One
-            // pooled counter would let it change whether an operator is
-            // nested; track the open reference's own delimiter instead.
-            let mut reference: Option<(SyntaxKind, SyntaxKind, usize)> = None;
+            // a literal `)` inside `${...}` or `{` inside `$(...)` is text. A
+            // stack of open references, each with its own delimiter pair and
+            // depth, keeps a nested `${...}` from closing its `$(...)` parent.
+            let mut references: Vec<(SyntaxKind, SyntaxKind, usize)> = Vec::new();
             let mut previous = None;
             let mut escaped = false;
             for (kind, _) in self.tokens.iter().rev() {
                 if *kind == NEWLINE && !escaped {
                     return true;
                 }
-                reference = match (reference, *kind) {
-                    (Some((open, close, depth)), k) if k == open => Some((open, close, depth + 1)),
-                    (Some((open, close, depth)), k) if k == close => {
-                        (depth > 1).then_some((open, close, depth - 1))
+                let opens_reference = previous == Some(DOLLAR);
+                match (*kind, references.last_mut()) {
+                    (LPAREN, _) if opens_reference => references.push((LPAREN, RPAREN, 1)),
+                    (LBRACE, _) if opens_reference => references.push((LBRACE, RBRACE, 1)),
+                    (k, Some(top)) if k == top.0 => top.2 += 1,
+                    (k, Some(top)) if k == top.1 => {
+                        top.2 -= 1;
+                        if top.2 == 0 {
+                            references.pop();
+                        }
                     }
-                    (None, LPAREN) if previous == Some(DOLLAR) => Some((LPAREN, RPAREN, 1)),
-                    (None, LBRACE) if previous == Some(DOLLAR) => Some((LBRACE, RBRACE, 1)),
-                    (None, OPERATOR) => return false,
-                    (state, _) => state,
-                };
+                    (OPERATOR, None) => return false,
+                    _ => {}
+                }
                 previous = Some(*kind);
                 // Same parity rule as `pending_backslash_escape`.
                 escaped = *kind == BACKSLASH && !escaped;
@@ -9036,6 +9040,19 @@ mod test_expansion {
             matches!(items.as_slice(), [MakefileItem::Rule(_)]),
             "the colon after the reference makes a rule"
         );
+    }
+
+    #[test]
+    fn test_mixed_delimiters_nest_as_separate_references() {
+        // The `)` inside the nested `${...}` is text, so it must not close
+        // the outer `$(...)` and expose the colon that still belongs to it.
+        for src in ["$(info ${foo):bar})\n", "${info $(foo}:bar)}\n"] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Expansion(_)]),
+                "{src:?} is an expansion"
+            );
+        }
     }
 
     #[test]
