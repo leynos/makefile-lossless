@@ -1366,16 +1366,28 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() != Some(DOLLAR) {
                 return false;
             }
-            let mut depth = 0_usize;
+            // GNU Make balances only the delimiter a reference opened with, so
+            // a literal `)` inside `${...}` or `{` inside `$(...)` is text. One
+            // pooled counter would let it change whether an operator is
+            // nested; track the open reference's own delimiter instead.
+            let mut reference: Option<(SyntaxKind, SyntaxKind, usize)> = None;
+            let mut previous = None;
             let mut escaped = false;
             for (kind, _) in self.tokens.iter().rev() {
-                match kind {
-                    NEWLINE if !escaped => return true,
-                    LPAREN | LBRACE => depth += 1,
-                    RPAREN | RBRACE => depth = depth.saturating_sub(1),
-                    OPERATOR if depth == 0 => return false,
-                    _ => {}
+                if *kind == NEWLINE && !escaped {
+                    return true;
                 }
+                reference = match (reference, *kind) {
+                    (Some((open, close, depth)), k) if k == open => Some((open, close, depth + 1)),
+                    (Some((open, close, depth)), k) if k == close => {
+                        (depth > 1).then_some((open, close, depth - 1))
+                    }
+                    (None, LPAREN) if previous == Some(DOLLAR) => Some((LPAREN, RPAREN, 1)),
+                    (None, LBRACE) if previous == Some(DOLLAR) => Some((LBRACE, RBRACE, 1)),
+                    (None, OPERATOR) => return false,
+                    (state, _) => state,
+                };
+                previous = Some(*kind);
                 // Same parity rule as `pending_backslash_escape`.
                 escaped = *kind == BACKSLASH && !escaped;
             }
@@ -9005,6 +9017,25 @@ mod test_expansion {
                 "{src:?} is not an expansion line"
             );
         }
+    }
+
+    #[test]
+    fn test_a_literal_of_the_other_delimiter_does_not_change_nesting() {
+        // A `)` inside `${...}` is text, so the colon stays inside the
+        // reference and the line is a bare expansion, not a rule.
+        for src in ["${info ):}\n", "$(info }:)\n", "$(info {:)\n"] {
+            let items = clean_items(src);
+            assert!(
+                matches!(items.as_slice(), [MakefileItem::Expansion(_)]),
+                "{src:?} is an expansion"
+            );
+        }
+        // An unmatched `{` inside `$(...)` does not hide the external colon.
+        let items = clean_items("$(addprefix {,foo): dep\n");
+        assert!(
+            matches!(items.as_slice(), [MakefileItem::Rule(_)]),
+            "the colon after the reference makes a rule"
+        );
     }
 
     #[test]

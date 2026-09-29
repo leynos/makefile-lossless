@@ -58,6 +58,24 @@ rule.push_command("$(PYTHON) setup.py build");
 print!("{}", makefile);
 ```
 
+Bare expansion lines
+--------------------
+
+A line that begins with a `$` reference and carries no `:` or assignment
+operator outside its references, such as `$(info ...)`, `$(error ...)` or
+`$(eval ...)`, is neither a rule nor an assignment. GNU Make expands it and
+parses the result, which the parser cannot do, so it keeps the line as a
+`MakefileItem::Expansion` rather than reporting a rule with no `:`:
+
+```rust
+use makefile_lossless::{Makefile, MakefileItem};
+
+let makefile: Makefile = "$(info hello)\n".parse().unwrap();
+let items: Vec<_> = makefile.items().collect();
+
+assert!(matches!(items.as_slice(), [MakefileItem::Expansion(_)]));
+```
+
 License
 -------
 
