@@ -33,3 +33,7 @@ path = "fuzz_targets/incremental_edit.rs"
 test = false
 doc = false
 bench = false
+
+[profile.dev]
+incremental = false
+debug = 0
