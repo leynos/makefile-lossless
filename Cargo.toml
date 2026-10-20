@@ -16,3 +16,7 @@ rowan = "^0.16"
 
 [dev-dependencies]
 maplit = "1.0.2"
+
+[profile.dev]
+incremental = false
+debug = 0
